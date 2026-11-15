@@ -1,0 +1,18 @@
+# Set an immutable image reference before rendering.
+image: ""
+# Choose a DNS subdomain controlled by the operator.
+groupName: ""
+imagePullPolicy: IfNotPresent
+credentialSecret: volcengine-dns-credentials
+journalName: volcengine-dns01-journal
+allowedNamespaces:
+  - cert-manager
+# Explicit FQDN, zone, numeric zoneID and non-default project for every target.
+targets: []
+resources:
+  requests:
+    cpu: 50m
+    memory: 128Mi
+  limits:
+    cpu: 500m
+    memory: 512Mi

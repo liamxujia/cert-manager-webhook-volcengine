@@ -1,0 +1,252 @@
+{{- $image := required "image is required and must be pinned by sha256 digest" .Values.image -}}
+{{- if not (regexMatch "^[a-zA-Z0-9._:/-]+@sha256:[a-f0-9]{64}$" $image) -}}
+{{- fail "image must be an immutable sha256 digest reference" -}}
+{{- end -}}
+{{- $group := required "groupName is required" .Values.groupName -}}
+{{- if or (gt (len $group) 253) (not (regexMatch `^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)+$` $group)) -}}
+{{- fail "groupName must be a lowercase DNS subdomain with at least two labels" -}}
+{{- end -}}
+{{- $targets := required "at least one DNS target is required" .Values.targets -}}
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: volcengine-dns01
+  namespace: {{ .Release.Namespace }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: volcengine-dns01-journal
+  namespace: {{ .Release.Namespace }}
+rules:
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    resourceNames: [{{ .Values.journalName | quote }}]
+    verbs: ["get", "update"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: volcengine-dns01-journal
+  namespace: {{ .Release.Namespace }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: volcengine-dns01-journal
+subjects:
+  - kind: ServiceAccount
+    name: volcengine-dns01
+    namespace: {{ .Release.Namespace }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: volcengine-dns01-auth-reader
+  namespace: kube-system
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: extension-apiserver-authentication-reader
+subjects:
+  - kind: ServiceAccount
+    name: volcengine-dns01
+    namespace: {{ .Release.Namespace }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: volcengine-dns01-auth-delegator
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: system:auth-delegator
+subjects:
+  - kind: ServiceAccount
+    name: volcengine-dns01
+    namespace: {{ .Release.Namespace }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: volcengine-dns01-solver
+rules:
+  - apiGroups: [{{ $group | quote }}]
+    resources: ["volcengine"]
+    verbs: ["create"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: volcengine-dns01-solver
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: volcengine-dns01-solver
+subjects:
+  - kind: ServiceAccount
+    name: cert-manager
+    namespace: cert-manager
+---
+apiVersion: cert-manager.io/v1
+kind: Issuer
+metadata:
+  name: volcengine-dns01-selfsigned
+  namespace: {{ .Release.Namespace }}
+spec:
+  selfSigned: {}
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: volcengine-dns01-ca
+  namespace: {{ .Release.Namespace }}
+spec:
+  isCA: true
+  commonName: volcengine-dns01-ca
+  secretName: volcengine-dns01-ca
+  issuerRef:
+    name: volcengine-dns01-selfsigned
+    kind: Issuer
+---
+apiVersion: cert-manager.io/v1
+kind: Issuer
+metadata:
+  name: volcengine-dns01-ca
+  namespace: {{ .Release.Namespace }}
+spec:
+  ca:
+    secretName: volcengine-dns01-ca
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: volcengine-dns01-serving
+  namespace: {{ .Release.Namespace }}
+spec:
+  secretName: volcengine-dns01-serving
+  dnsNames:
+    - volcengine-dns01.{{ .Release.Namespace }}.svc
+    - volcengine-dns01.{{ .Release.Namespace }}.svc.cluster.local
+  issuerRef:
+    name: volcengine-dns01-ca
+    kind: Issuer
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: volcengine-dns01
+  namespace: {{ .Release.Namespace }}
+spec:
+  ports:
+    - name: https
+      port: 443
+      targetPort: https
+  selector:
+    app: volcengine-dns01
+---
+apiVersion: apiregistration.k8s.io/v1
+kind: APIService
+metadata:
+  name: {{ printf "v1alpha1.%s" $group | quote }}
+  annotations:
+    cert-manager.io/inject-ca-from: {{ printf "%s/volcengine-dns01-serving" .Release.Namespace | quote }}
+spec:
+  group: {{ $group | quote }}
+  version: v1alpha1
+  groupPriorityMinimum: 1000
+  versionPriority: 15
+  service:
+    name: volcengine-dns01
+    namespace: {{ .Release.Namespace }}
+    port: 443
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: volcengine-dns01
+  namespace: {{ .Release.Namespace }}
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: volcengine-dns01
+  template:
+    metadata:
+      labels:
+        app: volcengine-dns01
+    spec:
+      serviceAccountName: volcengine-dns01
+      enableServiceLinks: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: webhook
+          image: {{ $image | quote }}
+          imagePullPolicy: {{ .Values.imagePullPolicy }}
+          args:
+            - --secure-port=6443
+            - --tls-cert-file=/tls/tls.crt
+            - --tls-private-key-file=/tls/tls.key
+          env:
+            - name: GROUP_NAME
+              value: {{ $group | quote }}
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: JOURNAL_NAME
+              value: {{ .Values.journalName | quote }}
+            - name: ALLOWED_NAMESPACES
+              value: {{ join "," .Values.allowedNamespaces | quote }}
+            - name: DNS_TARGETS_JSON
+              value: {{ $targets | toJson | quote }}
+            - name: VOLCENGINE_ACCESS_KEY_FILE
+              value: /credentials/access-key
+            - name: VOLCENGINE_SECRET_KEY_FILE
+              value: /credentials/secret-key
+          ports:
+            - name: https
+              containerPort: 6443
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          readinessProbe:
+            httpGet:
+              scheme: HTTPS
+              path: /healthz
+              port: https
+          livenessProbe:
+            httpGet:
+              scheme: HTTPS
+              path: /healthz
+              port: https
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+          volumeMounts:
+            - name: credentials
+              mountPath: /credentials
+              readOnly: true
+            - name: tls
+              mountPath: /tls
+              readOnly: true
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: credentials
+          secret:
+            secretName: {{ .Values.credentialSecret | quote }}
+            defaultMode: 288
+        - name: tls
+          secret:
+            secretName: volcengine-dns01-serving
+        - name: tmp
+          emptyDir:
+            medium: Memory
+            sizeLimit: 32Mi
